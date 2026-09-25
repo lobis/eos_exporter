@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	osuser "os/user"
@@ -225,6 +226,7 @@ type NSInfo struct {
 	Cache_files_hits                           string
 	Cache_containers_requests                  string
 	Cache_containers_hits                      string
+	Traffic_shaping_enabled                    string
 }
 
 type NSActivityInfo struct {
@@ -344,10 +346,6 @@ func getUnixUser(username string) (*osuser.User, error) {
 
 // exec executes the command and returns the stdout, stderr and return code
 func (c *Client) execute(cmd *exec.Cmd) (string, string, error) {
-	cmd.Env = []string{
-		"EOS_MGM_URL=" + c.opt.URL,
-	}
-
 	outBuf := &bytes.Buffer{}
 	errBuf := &bytes.Buffer{}
 	cmd.Stdout = outBuf
@@ -434,18 +432,29 @@ func (c *Client) ListFS(ctx context.Context, username string) ([]*FSInfo, error)
 
 // List the activity of different users in the instance
 func (c *Client) ListNS(ctx context.Context) ([]*NSInfo, []*NSActivityInfo, []*NSBatchInfo, error) {
+	ctxWt, cancel := c.getTimeout(ctx)
+	defer cancel()
+
+	stdoutHuman, stderrHuman, errHuman := c.execute(exec.CommandContext(ctxWt, "/usr/bin/eos", "ns", "stat"))
+	if errHuman != nil {
+		// Older EOS versions may not expose traffic shaping details in `eos ns stat`.
+		// Keep namespace metrics available and simply omit the shaping-enabled gauge.
+		c.opt.Logger.Info("optional eos ns stat failed, skipping traffic shaping status", zap.Error(errHuman), zap.String("stderr", strings.TrimSpace(stderrHuman)))
+		stdoutHuman = ""
+	}
+
 	// eos ns stat, without -a will exclude batch users info (this adds to much latency in the instance where the exporter is deployed)
-	stdout, _, err := c.execute(exec.CommandContext(ctx, "/usr/bin/eos", "ns", "stat", "-m"))
+	stdout, stderr, err := c.execute(exec.CommandContext(ctxWt, "/usr/bin/eos", "ns", "stat", "-m"))
 	if err != nil {
-		return nil, nil, nil, err
+		return nil, nil, nil, fmt.Errorf("eos ns stat -m failed: %w (stderr: %s)", err, strings.TrimSpace(stderr))
 	}
 
-	stdo, _, err2 := c.execute(exec.CommandContext(ctx, "/usr/bin/eos", "who", "-a", "-m"))
+	stdo, stderrWho, err2 := c.execute(exec.CommandContext(ctxWt, "/usr/bin/eos", "who", "-a", "-m"))
 	if err2 != nil {
-		return nil, nil, nil, err2
+		return nil, nil, nil, fmt.Errorf("eos who -a -m failed: %w (stderr: %s)", err2, strings.TrimSpace(stderrWho))
 	}
 
-	return c.parseNSsInfo(stdout, stdo, ctx)
+	return c.parseNSsInfo(stdout, stdo, stdoutHuman, ctx)
 }
 
 // List the IO info in the instance
@@ -725,8 +734,34 @@ func isInMap(a string, m map[string]int) bool {
 	return false
 }
 
+func parseNSTrafficShapingEnabled(raw string) string {
+	for _, line := range strings.Split(raw, "\n") {
+		lower := strings.ToLower(line)
+		if !strings.Contains(lower, "traffic shaping info") {
+			continue
+		}
+
+		idx := strings.Index(lower, "is_enabled=")
+		if idx == -1 {
+			continue
+		}
+
+		value := strings.TrimSpace(line[idx+len("is_enabled="):])
+		if value == "" {
+			continue
+		}
+
+		fields := strings.Fields(value)
+		if len(fields) > 0 {
+			value = fields[0]
+		}
+		return strings.Trim(value, ",;")
+	}
+	return ""
+}
+
 // Gathers information of the namespace
-func (c *Client) parseNSsInfo(raw string, raw_batch string, ctx context.Context) ([]*NSInfo, []*NSActivityInfo, []*NSBatchInfo, error) {
+func (c *Client) parseNSsInfo(raw string, raw_batch string, raw_human string, ctx context.Context) ([]*NSInfo, []*NSActivityInfo, []*NSBatchInfo, error) {
 	var kv map[string]string
 	var kvb map[string]string
 	var nsinfo *NSInfo
@@ -740,6 +775,7 @@ func (c *Client) parseNSsInfo(raw string, raw_batch string, ctx context.Context)
 	batchUsers := make(map[string]int)
 	batchMetrics := make(map[string]bool)
 	excl_uids := []string{"root", "nobody", "daemon", "wwweos", "all"}
+	trafficShapingEnabled := parseNSTrafficShapingEnabled(raw_human)
 	for _, rlb := range rawBatchLines {
 		if rlb == "" {
 			continue
@@ -867,6 +903,7 @@ func (c *Client) parseNSsInfo(raw string, raw_batch string, ctx context.Context)
 								kv["ns.cache.files.hits"],
 								kv["ns.cache.containers.requests"],
 								kv["ns.cache.containers.hits"],
+								trafficShapingEnabled,
 							}
 						}
 					}
@@ -1904,4 +1941,524 @@ func (c *Client) parseInspectorGroupCostDiskTBYearsLine(line string) (*Inspector
 		kv["tbyears"],
 	}
 	return groupCostDiskTBYearsInfo, nil
+}
+
+// ShapingStatsJSON represents a single entry returned by `eos io shaping ls --json`
+type ShapingStatsJSON struct {
+	ID           string      `json:"id"`
+	Type         string      `json:"type"`
+	WindowSec    json.Number `json:"window_sec"`
+	ReadRateBps  json.Number `json:"read_rate_bps"`
+	WriteRateBps json.Number `json:"write_rate_bps"`
+	ReadIops     json.Number `json:"read_iops"`
+	WriteIops    json.Number `json:"write_iops"`
+
+	EstimatorsLoopMedianUs json.Number `json:"estimators_loop_median_us"`
+	EstimatorsLoopMinUs    json.Number `json:"estimators_loop_min_us"`
+	EstimatorsLoopMaxUs    json.Number `json:"estimators_loop_max_us"`
+
+	FstLimitsLoopMedianUs json.Number `json:"fst_limits_loop_median_us"`
+	FstLimitsLoopMinUs    json.Number `json:"fst_limits_loop_min_us"`
+	FstLimitsLoopMaxUs    json.Number `json:"fst_limits_loop_max_us"`
+
+	ReportsProcessedPerSecMean json.Number `json:"reports_processed_per_sec_mean"`
+
+	SystemStatsWindowSeconds json.Number `json:"system_stats_window_seconds"`
+}
+
+// IOShapingStat is the parsing-friendly representation.
+type IOShapingStat struct {
+	ID           string
+	Type         string
+	WindowSec    string
+	ReadRateBps  string
+	WriteRateBps string
+	ReadIops     string
+	WriteIops    string
+
+	EstimatorsLoopMedianUs string
+	EstimatorsLoopMinUs    string
+	EstimatorsLoopMaxUs    string
+
+	FstLimitsLoopMedianUs string
+	FstLimitsLoopMinUs    string
+	FstLimitsLoopMaxUs    string
+
+	ReportsProcessedPerSecMean string
+
+	SystemStatsWindowSeconds string
+}
+
+// ShapingFSStatsJSON represents a single filesystem entry returned by `eos io shaping ls --fs --json`.
+type ShapingFSStatsJSON struct {
+	Type         string      `json:"type"`
+	NodeID       string      `json:"node_id"`
+	FSID         json.Number `json:"fsid"`
+	WindowSec    json.Number `json:"window_sec"`
+	ReadRateBps  json.Number `json:"read_rate_bps"`
+	WriteRateBps json.Number `json:"write_rate_bps"`
+	ReadIops     json.Number `json:"read_iops"`
+	WriteIops    json.Number `json:"write_iops"`
+}
+
+// IOShapingFSStat is the parsing-friendly representation of filesystem shaping stats.
+type IOShapingFSStat struct {
+	Type         string
+	NodeID       string
+	FSID         string
+	WindowSec    string
+	ReadRateBps  string
+	WriteRateBps string
+	ReadIops     string
+	WriteIops    string
+}
+
+// ShapingAllStatsJSON represents a single all-tags entry returned by `eos io shaping ls --all --json`.
+type ShapingAllStatsJSON struct {
+	Type         string      `json:"type"`
+	ID           string      `json:"id"`
+	NodeID       string      `json:"node_id"`
+	FSID         json.Number `json:"fsid"`
+	App          string      `json:"app"`
+	UID          json.Number `json:"uid"`
+	GID          json.Number `json:"gid"`
+	WindowSec    json.Number `json:"window_sec"`
+	ReadRateBps  json.Number `json:"read_rate_bps"`
+	WriteRateBps json.Number `json:"write_rate_bps"`
+	ReadIops     json.Number `json:"read_iops"`
+	WriteIops    json.Number `json:"write_iops"`
+
+	EstimatorsLoopMedianUs json.Number `json:"estimators_loop_median_us"`
+	EstimatorsLoopMinUs    json.Number `json:"estimators_loop_min_us"`
+	EstimatorsLoopMaxUs    json.Number `json:"estimators_loop_max_us"`
+
+	FstLimitsLoopMedianUs json.Number `json:"fst_limits_loop_median_us"`
+	FstLimitsLoopMinUs    json.Number `json:"fst_limits_loop_min_us"`
+	FstLimitsLoopMaxUs    json.Number `json:"fst_limits_loop_max_us"`
+
+	ReportsProcessedPerSecMean json.Number `json:"reports_processed_per_sec_mean"`
+
+	SystemStatsWindowSeconds json.Number `json:"system_stats_window_seconds"`
+}
+
+// IOShapingAllStat is the parsing-friendly representation of all-tags shaping stats.
+type IOShapingAllStat struct {
+	Type         string
+	ID           string
+	NodeID       string
+	FSID         string
+	App          string
+	UID          string
+	GID          string
+	WindowSec    string
+	ReadRateBps  string
+	WriteRateBps string
+	ReadIops     string
+	WriteIops    string
+
+	EstimatorsLoopMedianUs string
+	EstimatorsLoopMinUs    string
+	EstimatorsLoopMaxUs    string
+
+	FstLimitsLoopMedianUs string
+	FstLimitsLoopMinUs    string
+	FstLimitsLoopMaxUs    string
+
+	ReportsProcessedPerSecMean string
+
+	SystemStatsWindowSeconds string
+}
+
+// ListIOShaping runs `eos io shaping ls --json --sys --window` for apps, users, and groups
+func (c *Client) ListIOShaping(ctx context.Context, windowTimeSeconds int) ([]*IOShapingStat, error) {
+	ctxWt, cancel := c.getTimeout(ctx)
+	defer cancel()
+
+	var allStats []*IOShapingStat
+	groupFlags := []string{"--apps", "--users", "--groups", "--nodes"}
+
+	for _, flag := range groupFlags {
+		// Appended "--sys" to ensure the system object is included in the JSON array
+		cmd := exec.CommandContext(
+			ctxWt,
+			"/usr/bin/eos", "io", "shaping", "ls",
+			"--json", "--sys",
+			"--window", strconv.Itoa(windowTimeSeconds),
+			flag,
+		)
+
+		stdout, _, err := c.execute(cmd)
+		if err != nil {
+			return nil, fmt.Errorf("failed to fetch shaping stats for %s: %w", flag, err)
+		}
+
+		parsed, err := c.parseIOShaping(stdout)
+		if err != nil {
+			return nil, fmt.Errorf("failed to parse shaping stats for %s: %w", flag, err)
+		}
+
+		allStats = append(allStats, parsed...)
+	}
+
+	return allStats, nil
+}
+
+func (c *Client) parseIOShaping(raw string) ([]*IOShapingStat, error) {
+	trim := strings.TrimSpace(raw)
+	if trim == "" {
+		return []*IOShapingStat{}, nil
+	}
+
+	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.UseNumber()
+
+	var mj []ShapingStatsJSON
+	if err := dec.Decode(&mj); err != nil {
+		if err == io.EOF || trim == "[]" {
+			return []*IOShapingStat{}, nil
+		}
+		return nil, fmt.Errorf("failed to decode io shaping json: %w", err)
+	}
+
+	out := make([]*IOShapingStat, 0, len(mj))
+	for _, v := range mj {
+		stat := &IOShapingStat{
+			ID:                         v.ID,
+			Type:                       v.Type,
+			WindowSec:                  v.WindowSec.String(),
+			ReadRateBps:                v.ReadRateBps.String(),
+			WriteRateBps:               v.WriteRateBps.String(),
+			ReadIops:                   v.ReadIops.String(),
+			WriteIops:                  v.WriteIops.String(),
+			EstimatorsLoopMedianUs:     v.EstimatorsLoopMedianUs.String(),
+			EstimatorsLoopMinUs:        v.EstimatorsLoopMinUs.String(),
+			EstimatorsLoopMaxUs:        v.EstimatorsLoopMaxUs.String(),
+			FstLimitsLoopMedianUs:      v.FstLimitsLoopMedianUs.String(),
+			FstLimitsLoopMinUs:         v.FstLimitsLoopMinUs.String(),
+			FstLimitsLoopMaxUs:         v.FstLimitsLoopMaxUs.String(),
+			ReportsProcessedPerSecMean: v.ReportsProcessedPerSecMean.String(),
+			SystemStatsWindowSeconds:   v.SystemStatsWindowSeconds.String(),
+		}
+		out = append(out, stat)
+	}
+
+	return out, nil
+}
+
+// ListIOShapingFS runs `eos io shaping ls --fs --json` and parses the output.
+func (c *Client) ListIOShapingFS(ctx context.Context) ([]*IOShapingFSStat, error) {
+	ctxWt, cancel := c.getTimeout(ctx)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctxWt, "/usr/bin/eos", "io", "shaping", "ls", "--fs", "--json")
+	stdout, _, err := c.execute(cmd)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch filesystem shaping stats: %w", err)
+	}
+
+	return c.parseIOShapingFS(stdout)
+}
+
+func (c *Client) parseIOShapingFS(raw string) ([]*IOShapingFSStat, error) {
+	trim := strings.TrimSpace(raw)
+	if trim == "" {
+		return []*IOShapingFSStat{}, nil
+	}
+
+	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.UseNumber()
+
+	var mj []ShapingFSStatsJSON
+	if err := dec.Decode(&mj); err != nil {
+		if err == io.EOF || trim == "[]" {
+			return []*IOShapingFSStat{}, nil
+		}
+		return nil, fmt.Errorf("failed to decode filesystem io shaping json: %w", err)
+	}
+
+	out := make([]*IOShapingFSStat, 0, len(mj))
+	for _, v := range mj {
+		stat := &IOShapingFSStat{
+			Type:         v.Type,
+			NodeID:       v.NodeID,
+			FSID:         v.FSID.String(),
+			WindowSec:    v.WindowSec.String(),
+			ReadRateBps:  v.ReadRateBps.String(),
+			WriteRateBps: v.WriteRateBps.String(),
+			ReadIops:     v.ReadIops.String(),
+			WriteIops:    v.WriteIops.String(),
+		}
+		out = append(out, stat)
+	}
+
+	return out, nil
+}
+
+// ListIOShapingAll runs `eos io shaping ls --all --sys --window` and parses the output.
+func (c *Client) ListIOShapingAll(ctx context.Context, windowTimeSeconds int) ([]*IOShapingAllStat, error) {
+	ctxWt, cancel := c.getTimeout(ctx)
+	defer cancel()
+
+	cmd := exec.CommandContext(
+		ctxWt,
+		"/usr/bin/eos", "io", "shaping", "ls",
+		"--all", "--sys",
+		"--window", strconv.Itoa(windowTimeSeconds),
+		"--json",
+	)
+	stdout, _, err := c.execute(cmd)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch all-tags shaping stats for window %ds: %w", windowTimeSeconds, err)
+	}
+
+	return c.parseIOShapingAll(stdout)
+}
+
+func (c *Client) parseIOShapingAll(raw string) ([]*IOShapingAllStat, error) {
+	trim := strings.TrimSpace(raw)
+	if trim == "" {
+		return []*IOShapingAllStat{}, nil
+	}
+
+	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.UseNumber()
+
+	var mj []ShapingAllStatsJSON
+	if err := dec.Decode(&mj); err != nil {
+		if err == io.EOF || trim == "[]" {
+			return []*IOShapingAllStat{}, nil
+		}
+		return nil, fmt.Errorf("failed to decode all-tags io shaping json: %w", err)
+	}
+
+	out := make([]*IOShapingAllStat, 0, len(mj))
+	for _, v := range mj {
+		stat := &IOShapingAllStat{
+			Type:         v.Type,
+			ID:           v.ID,
+			NodeID:       v.NodeID,
+			FSID:         v.FSID.String(),
+			App:          v.App,
+			UID:          v.UID.String(),
+			GID:          v.GID.String(),
+			WindowSec:    v.WindowSec.String(),
+			ReadRateBps:  v.ReadRateBps.String(),
+			WriteRateBps: v.WriteRateBps.String(),
+			ReadIops:     v.ReadIops.String(),
+			WriteIops:    v.WriteIops.String(),
+
+			EstimatorsLoopMedianUs:     v.EstimatorsLoopMedianUs.String(),
+			EstimatorsLoopMinUs:        v.EstimatorsLoopMinUs.String(),
+			EstimatorsLoopMaxUs:        v.EstimatorsLoopMaxUs.String(),
+			FstLimitsLoopMedianUs:      v.FstLimitsLoopMedianUs.String(),
+			FstLimitsLoopMinUs:         v.FstLimitsLoopMinUs.String(),
+			FstLimitsLoopMaxUs:         v.FstLimitsLoopMaxUs.String(),
+			ReportsProcessedPerSecMean: v.ReportsProcessedPerSecMean.String(),
+			SystemStatsWindowSeconds:   v.SystemStatsWindowSeconds.String(),
+		}
+		out = append(out, stat)
+	}
+
+	return out, nil
+}
+
+// ShapingPolicyJSON represents a single policy from the new flat JSON array
+type ShapingPolicyJSON struct {
+	ID                              string      `json:"id"`
+	Type                            string      `json:"type"`
+	IsEnabled                       bool        `json:"is_enabled"`
+	LimitReadBytesPerSec            json.Number `json:"limit_read_bytes_per_sec"`
+	LimitWriteBytesPerSec           json.Number `json:"limit_write_bytes_per_sec"`
+	ReservationReadBytesPerSec      json.Number `json:"reservation_read_bytes_per_sec"`
+	ReservationWriteBytesPerSec     json.Number `json:"reservation_write_bytes_per_sec"`
+	ControllerLimitReadBytesPerSec  json.Number `json:"controller_limit_read_bytes_per_sec"`
+	ControllerLimitWriteBytesPerSec json.Number `json:"controller_limit_write_bytes_per_sec"`
+}
+
+// IOShapingPolicyStat is the parsing-friendly struct
+type IOShapingPolicyStat struct {
+	Type                      string
+	ID                        string
+	IsEnabled                 bool
+	LimitReadBytes            string
+	LimitWriteBytes           string
+	ReservationReadBytes      string
+	ReservationWriteBytes     string
+	ControllerLimitReadBytes  string
+	ControllerLimitWriteBytes string
+}
+
+// IOShapingConfigJSON represents the output returned by `eos io shaping config ls --json`.
+type IOShapingConfigJSON struct {
+	Enabled                      bool        `json:"enabled"`
+	EstimatorsUpdatePeriodMs     json.Number `json:"estimators_update_period_ms"`
+	FstIOPolicyUpdatePeriodMs    json.Number `json:"fst_io_policy_update_period_ms"`
+	FstIOStatsReportingPeriodMs  json.Number `json:"fst_io_stats_reporting_period_ms"`
+	DetailLevel                  string      `json:"detail_level"`
+	SystemStatsTimeWindowSeconds json.Number `json:"system_stats_time_window_seconds"`
+}
+
+// IOShapingConfig is the parsing-friendly representation of traffic shaping config.
+type IOShapingConfig struct {
+	Enabled                      bool
+	EstimatorsUpdatePeriodMs     string
+	FstIOPolicyUpdatePeriodMs    string
+	FstIOStatsReportingPeriodMs  string
+	DetailFilesystem             bool
+	SystemStatsTimeWindowSeconds string
+}
+
+// ListIOShapingConfig runs `eos io shaping config ls --json` and parses the output.
+// If JSON output is not available, it falls back to the human-readable command output.
+func (c *Client) ListIOShapingConfig(ctx context.Context) (*IOShapingConfig, error) {
+	ctxWt, cancel := c.getTimeout(ctx)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctxWt, "/usr/bin/eos", "io", "shaping", "config", "ls", "--json")
+	stdout, stderr, err := c.execute(cmd)
+	if err == nil {
+		return c.parseIOShapingConfig(stdout)
+	}
+
+	textCmd := exec.CommandContext(ctxWt, "/usr/bin/eos", "io", "shaping", "config", "ls")
+	textStdout, textStderr, textErr := c.execute(textCmd)
+	if textErr != nil {
+		return nil, fmt.Errorf("failed to fetch shaping config as json: %w (stderr: %s); text fallback failed: %w (stderr: %s)", err, strings.TrimSpace(stderr), textErr, strings.TrimSpace(textStderr))
+	}
+
+	config, parseErr := c.parseIOShapingConfigText(textStdout)
+	if parseErr != nil {
+		return nil, fmt.Errorf("failed to fetch shaping config as json: %w (stderr: %s); failed to parse text fallback: %w", err, strings.TrimSpace(stderr), parseErr)
+	}
+	return config, nil
+}
+
+func (c *Client) parseIOShapingConfig(raw string) (*IOShapingConfig, error) {
+	trim := strings.TrimSpace(raw)
+	if trim == "" {
+		return nil, fmt.Errorf("empty shaping config json")
+	}
+
+	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.UseNumber()
+
+	var config IOShapingConfigJSON
+	if err := dec.Decode(&config); err != nil {
+		return nil, fmt.Errorf("failed to decode shaping config json: %w", err)
+	}
+
+	detailLevel := strings.ToLower(strings.TrimSpace(config.DetailLevel))
+
+	return &IOShapingConfig{
+		Enabled:                      config.Enabled,
+		EstimatorsUpdatePeriodMs:     config.EstimatorsUpdatePeriodMs.String(),
+		FstIOPolicyUpdatePeriodMs:    config.FstIOPolicyUpdatePeriodMs.String(),
+		FstIOStatsReportingPeriodMs:  config.FstIOStatsReportingPeriodMs.String(),
+		DetailFilesystem:             detailLevel == "fs" || detailLevel == "filesystem",
+		SystemStatsTimeWindowSeconds: config.SystemStatsTimeWindowSeconds.String(),
+	}, nil
+}
+
+func (c *Client) parseIOShapingConfigText(raw string) (*IOShapingConfig, error) {
+	trim := strings.TrimSpace(raw)
+	if trim == "" {
+		return nil, fmt.Errorf("empty shaping config text")
+	}
+
+	config := &IOShapingConfig{}
+	var seen bool
+
+	for _, line := range strings.Split(raw, "\n") {
+		key, value, ok := strings.Cut(line, ":")
+		if !ok {
+			continue
+		}
+
+		key = strings.ToLower(strings.TrimSpace(key))
+		value = strings.TrimSpace(value)
+		fields := strings.Fields(value)
+		first := ""
+		if len(fields) > 0 {
+			first = fields[0]
+		}
+
+		switch key {
+		case "traffic shaping enabled":
+			switch strings.ToLower(first) {
+			case "true", "1", "yes", "enabled", "on":
+				config.Enabled = true
+				seen = true
+			case "false", "0", "no", "disabled", "off":
+				config.Enabled = false
+				seen = true
+			}
+		case "estimators update period":
+			config.EstimatorsUpdatePeriodMs = first
+			seen = true
+		case "fst io policy update period":
+			config.FstIOPolicyUpdatePeriodMs = first
+			seen = true
+		case "fst io stats reporting period":
+			config.FstIOStatsReportingPeriodMs = first
+			seen = true
+		case "stats detail level":
+			detailLevel := strings.ToLower(first)
+			config.DetailFilesystem = detailLevel == "fs" || detailLevel == "filesystem"
+			seen = true
+		case "system stats time window":
+			config.SystemStatsTimeWindowSeconds = first
+			seen = true
+		}
+	}
+
+	if !seen {
+		return nil, fmt.Errorf("no shaping config fields found in text output")
+	}
+	return config, nil
+}
+
+// ListIOShapingPolicies runs `eos io shaping policy ls --json` and parses the output
+func (c *Client) ListIOShapingPolicies(ctx context.Context) ([]*IOShapingPolicyStat, error) {
+	ctxWt, cancel := c.getTimeout(ctx)
+	defer cancel()
+
+	cmd := exec.CommandContext(ctxWt, "/usr/bin/eos", "io", "shaping", "policy", "ls", "--json")
+	stdout, _, err := c.execute(cmd)
+	if err != nil {
+		return nil, fmt.Errorf("failed to fetch shaping policies: %w", err)
+	}
+
+	return c.parseIOShapingPolicies(stdout)
+}
+
+func (c *Client) parseIOShapingPolicies(raw string) ([]*IOShapingPolicyStat, error) {
+	trim := strings.TrimSpace(raw)
+	if trim == "" || trim == "[]" {
+		return []*IOShapingPolicyStat{}, nil
+	}
+
+	dec := json.NewDecoder(strings.NewReader(raw))
+	dec.UseNumber()
+
+	var policies []ShapingPolicyJSON
+	if err := dec.Decode(&policies); err != nil {
+		return nil, fmt.Errorf("failed to decode shaping policies json: %w", err)
+	}
+
+	var out []*IOShapingPolicyStat
+	for _, p := range policies {
+		out = append(out, &IOShapingPolicyStat{
+			Type:                      p.Type,
+			ID:                        p.ID,
+			IsEnabled:                 p.IsEnabled,
+			LimitReadBytes:            p.LimitReadBytesPerSec.String(),
+			LimitWriteBytes:           p.LimitWriteBytesPerSec.String(),
+			ReservationReadBytes:      p.ReservationReadBytesPerSec.String(),
+			ReservationWriteBytes:     p.ReservationWriteBytesPerSec.String(),
+			ControllerLimitReadBytes:  p.ControllerLimitReadBytesPerSec.String(),
+			ControllerLimitWriteBytes: p.ControllerLimitWriteBytesPerSec.String(),
+		})
+	}
+
+	return out, nil
 }
