@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"strconv"
+	"sync"
 
 	"github.com/cern-eos/eos_exporter/eosclient"
 	"github.com/prometheus/client_golang/prometheus"
@@ -12,6 +13,10 @@ import (
 
 type IOShapingPolicyCollector struct {
 	*CollectorOpts
+	mu            sync.Mutex
+	idResolver    *unixIDResolver
+	failureLogged bool
+	fetch         func(context.Context) ([]*eosclient.IOShapingPolicyStat, error)
 
 	// Single grouped metric for all policy limits and reservations
 	PolicyBytes *prometheus.GaugeVec
@@ -25,8 +30,9 @@ func NewIOShapingPolicyCollector(opts *CollectorOpts) *IOShapingPolicyCollector 
 	// Split labels: rule (limit/reservation/controller_limit) and operation (read/write)
 	standardLabels := []string{"type", "id", "rule", "operation"}
 
-	return &IOShapingPolicyCollector{
+	o := &IOShapingPolicyCollector{
 		CollectorOpts: opts,
+		idResolver:    newUnixIDResolver(),
 		PolicyBytes: prometheus.NewGaugeVec(prometheus.GaugeOpts{
 			Namespace:   namespace,
 			Name:        "io_shaping_policy_bytes",
@@ -34,6 +40,14 @@ func NewIOShapingPolicyCollector(opts *CollectorOpts) *IOShapingPolicyCollector 
 			ConstLabels: labels,
 		}, standardLabels),
 	}
+	o.fetch = func(ctx context.Context) ([]*eosclient.IOShapingPolicyStat, error) {
+		client, err := eosclient.New(&eosclient.Options{URL: "root://" + getEOSInstance(), Timeout: opts.Timeout})
+		if err != nil {
+			return nil, err
+		}
+		return client.ListIOShapingPolicies(ctx)
+	}
+	return o
 }
 
 func (o *IOShapingPolicyCollector) collectorList() []prometheus.Collector {
@@ -43,20 +57,19 @@ func (o *IOShapingPolicyCollector) collectorList() []prometheus.Collector {
 }
 
 func (o *IOShapingPolicyCollector) collectIOShapingPolicies() error {
-	ins := getEOSInstance()
-	url := "root://" + ins
-	opt := &eosclient.Options{URL: url, Timeout: o.Timeout}
-	client, err := eosclient.New(opt)
-	if err != nil {
-		return fmt.Errorf("failed to create eosclient: %w", err)
-	}
-
-	policies, err := client.ListIOShapingPolicies(context.Background())
+	policies, err := o.fetch(context.Background())
 	if err != nil {
 		return fmt.Errorf("failed to collect IO shaping policies: %w", err)
 	}
 
 	for _, p := range policies {
+		id := p.ID
+		if p.Type == "uid" {
+			id = resolvedShapingID(id, o.idResolver.ResolveUser(id))
+		}
+		if p.Type == "gid" {
+			id = resolvedShapingID(id, o.idResolver.ResolveGroup(id))
+		}
 		// Helper to set the metric: uses the actual value if enabled, otherwise 0
 		setMetric := func(ruleName string, operation string, valStr string) {
 			valToSet := 0.0
@@ -77,7 +90,7 @@ func (o *IOShapingPolicyCollector) collectIOShapingPolicies() error {
 				}
 			}
 
-			o.PolicyBytes.WithLabelValues(p.Type, p.ID, ruleName, operation).Set(valToSet)
+			o.PolicyBytes.WithLabelValues(p.Type, id, ruleName, operation).Set(valToSet)
 		}
 
 		setMetric("limit", "read", p.LimitReadBytes)
@@ -98,6 +111,8 @@ func (o *IOShapingPolicyCollector) Describe(ch chan<- *prometheus.Desc) {
 }
 
 func (o *IOShapingPolicyCollector) Collect(ch chan<- prometheus.Metric) {
+	o.mu.Lock()
+	defer o.mu.Unlock()
 	// Reset the GaugeVec before scrape
 	for _, metric := range o.collectorList() {
 		if gaugeVec, ok := metric.(*prometheus.GaugeVec); ok {
@@ -106,9 +121,13 @@ func (o *IOShapingPolicyCollector) Collect(ch chan<- prometheus.Metric) {
 	}
 
 	if err := o.collectIOShapingPolicies(); err != nil {
-		log.Println("failed collecting IO shaping policy metrics:", err)
+		if !o.failureLogged {
+			log.Println("failed collecting IO shaping policy metrics:", err)
+			o.failureLogged = true
+		}
 		return
 	}
+	o.failureLogged = false
 
 	for _, metric := range o.collectorList() {
 		metric.Collect(ch)

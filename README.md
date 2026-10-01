@@ -50,3 +50,93 @@ It also includes plots for node_exporter metrics, if available.
 ## Troubleshooting
 
 This tool is provided by CERN EOS Operators. Report issues on Github tracker or contact us through the [EOS community forum](https://eos-community.web.cern.ch/)
+
+## Traffic-shaping dashboard compatibility on EOS 5.4
+
+The `traffic_shaping_io` collector consumes the cumulative counter snapshot from
+`eos io shaping ls --apps --json --sys`. It requires the corresponding EOS 5.4
+monitoring patch (`engine_meta.counters.version = 1`). It does not require a new
+console client, `--all`, filesystem traffic detail, or native Prometheus support in EOS.
+The EOS shaping collector must already be enabled. This exporter does not enable
+it or change enforcement/policies.
+
+The EOS 5.4 Orbit endpoint wraps shaping IO, policies, configuration, MGM role
+and the fleet snapshot together. Enable it
+with `--enable-fast-exporter` and scrape port `9987` to collect these metrics.
+The standard endpoint keeps its existing collectors, including shaping
+configuration and the leader MGM version. An unsupported counter snapshot
+reports `eos_io_shaping_scrape_success=0` and omits the fleet/configuration
+compatibility evidence on the fast endpoint, so Orbit cannot mistake missing
+counters for an idle cluster. The fast
+shaping collectors log a failure once until collection succeeds again.
+
+For the supplied Grafana dashboard, set Prometheus `scrape_interval` to 15s
+and Grafana's Prometheus data-source scrape interval to the same value.
+
+The collector replaces its old windowed rate gauges with genuine counters:
+
+- `eos_io_shaping_bytes_total` and `eos_io_shaping_operations_total`, with
+  `cluster`, `type`, `id`, `operation` labels (`type=app|uid|gid|node`).
+- `eos_io_shaping_all_bytes_total` and `eos_io_shaping_all_operations_total`,
+  with the native exporter's node/application/user/group labels, including
+  numeric `uid_id`/`gid_id` and resolved `id(name)` labels.
+
+Existing dashboard `rate(...[$__rate_interval])` queries therefore work without
+rate-gauge fallbacks. Overview, rankings, node/application/user/group drill-downs,
+policies, loop timings and report-processing panels are supported. Counter values
+come directly from EOS; exporter restarts do not reset them, and MGM resets are
+preserved for Prometheus to detect. A one-second cache shares snapshots between
+concurrent scrapes. Refresh failure removes stale traffic samples and sets
+`eos_io_shaping_scrape_success=0`; unsupported EOS releases fail explicitly.
+
+`eos_monit_enabled=1` advertises this exporter's monitoring interface so existing
+dashboard instance selectors work. It does **not** imply shaping enforcement is
+enabled. `eos_monit_cache_ttl_seconds` describes the counter snapshot cache.
+
+Filesystem detail is intentionally unavailable: `fsid="0"` is the aggregate
+placeholder, and no `eos_io_shaping_fs_*` counters are fabricated. Leave the
+filesystem selector on All. Filesystem activity/count panels may show this one
+placeholder bucket; they do not measure physical filesystems. Newer controller,
+pressure and internal-map diagnostics are also unavailable. Do not scrape native
+and external shaping counters into the same dashboard selection simultaneously.
+
+EOS retains at most 50,000 identities and an estimated 64 MiB of counter state.
+Watch `eos_io_shaping_counter_entries_rejected_total` and
+`eos_io_shaping_all_entries_limited`; nonzero values indicate incomplete traffic
+coverage. Existing identities continue counting when admission is limited.
+
+The fast endpoint additionally publishes `eos_mgm_master`, leader
+`eos_mgm_info`, and the `eos_fst_node_*` / `eos_fst_filesystem_*` inventory,
+state and capacity families consumed by EOS Orbit. Node and filesystem states
+come from their own original MGM fields, including EOS 5.4's `local.drain`;
+unknown states remain unknown. Capacity and filesystem inventory do not imply
+filesystem traffic attribution.
+
+Local MGM role and counter snapshots are cached for one second. Fleet queries
+(`node ls -m`, `fs ls -m`) run at most once every 30 seconds; the exported fleet
+timestamp remains the time of that successful read. A failed refresh removes
+those samples and emits `eos_orbit_scrape_success{source="fleet"}=0`.
+Followers emit role zero and do not query/export leader traffic or fleet data.
+Role failures omit role and all cluster data. No old role, configuration or
+fleet snapshot is silently marked healthy after a failed refresh.
+
+For discovery through EOS Prometheus federation, scrape this endpoint as
+`job="eos_fast"`, port `9987`, with the correct cluster label. Orbit already
+selects the required families. On EOS 5.5 and later leave the external fast
+endpoint disabled and use the native MGM endpoint (`eos_xrootd`, or the native
+`eos_fast` endpoint during migration). Orbit prefers a compatible native source;
+this patch does not add a 5.5 JSON dependency or invent unavailable controller,
+actuator, queue-depth or QuarkDB telemetry.
+
+`testdata/orbit-eos54-node.txt` and `orbit-eos54-fs.txt` are read-only captures
+from the EOS 5.4 development MGM on 2026-10-01. Parser tests exercise these
+actual command formats, in addition to synthetic counter and failure fixtures.
+
+Validation:
+
+```sh
+./get_build_info.sh
+go test -race ./...
+go build
+promtool test rules testdata/shaping-dashboard.test.yml
+```

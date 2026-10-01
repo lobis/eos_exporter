@@ -12,7 +12,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 )
 
-const ioShapingConfigRefreshInterval = 0 * time.Minute
+const ioShapingConfigRefreshInterval = time.Second
 
 type IOShapingConfigCollector struct {
 	*CollectorOpts
@@ -20,6 +20,7 @@ type IOShapingConfigCollector struct {
 	mu          sync.Mutex
 	lastRefresh time.Time
 	config      *eosclient.IOShapingConfig
+	fetch       func(context.Context) (*eosclient.IOShapingConfig, error)
 
 	Enabled                     *prometheus.GaugeVec
 	EstimatorsUpdatePeriodMs    *prometheus.GaugeVec
@@ -34,7 +35,7 @@ func NewIOShapingConfigCollector(opts *CollectorOpts) *IOShapingConfigCollector 
 	labels := prometheus.Labels{"cluster": cluster}
 	namespace := "eos"
 
-	return &IOShapingConfigCollector{
+	o := &IOShapingConfigCollector{
 		CollectorOpts: opts,
 
 		Enabled: prometheus.NewGaugeVec(prometheus.GaugeOpts{
@@ -79,6 +80,14 @@ func NewIOShapingConfigCollector(opts *CollectorOpts) *IOShapingConfigCollector 
 			ConstLabels: labels,
 		}, []string{}),
 	}
+	o.fetch = func(ctx context.Context) (*eosclient.IOShapingConfig, error) {
+		client, err := eosclient.New(&eosclient.Options{URL: "root://" + getEOSInstance(), Timeout: opts.Timeout})
+		if err != nil {
+			return nil, err
+		}
+		return client.ListIOShapingConfig(ctx)
+	}
+	return o
 }
 
 func (o *IOShapingConfigCollector) collectorList() []prometheus.Collector {
@@ -93,15 +102,7 @@ func (o *IOShapingConfigCollector) collectorList() []prometheus.Collector {
 }
 
 func (o *IOShapingConfigCollector) fetchIOShapingConfig() (*eosclient.IOShapingConfig, error) {
-	ins := getEOSInstance()
-	url := "root://" + ins
-	opt := &eosclient.Options{URL: url, Timeout: o.Timeout}
-	client, err := eosclient.New(opt)
-	if err != nil {
-		return nil, fmt.Errorf("failed to create eosclient: %w", err)
-	}
-
-	config, err := client.ListIOShapingConfig(context.Background())
+	config, err := o.fetch(context.Background())
 	if err != nil {
 		return nil, fmt.Errorf("failed to collect IO shaping config: %w", err)
 	}
@@ -119,10 +120,7 @@ func (o *IOShapingConfigCollector) configForScrape() (*eosclient.IOShapingConfig
 
 	config, err := o.fetchIOShapingConfig()
 	if err != nil {
-		if o.config != nil {
-			log.Println("failed refreshing IO shaping config metrics, using cached values:", err)
-			return o.config, nil
-		}
+		o.config = nil
 		return nil, err
 	}
 
